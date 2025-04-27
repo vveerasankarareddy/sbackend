@@ -1,0 +1,440 @@
+const express = require('express');
+const router = express.Router();
+const crypto = require('crypto');
+const { MailtrapClient } = require('mailtrap');
+const User = require('../models/User');
+const redis = require('../config/redis');
+const UAParser = require('ua-parser-js');
+const rateLimit = require('express-rate-limit');
+
+// Rate limiter for login and signup
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: 'Too many login attempts, please try again later.',
+});
+
+const signupLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: 'Too many signup attempts, please try again later.',
+});
+
+// Generate a unique 9-character userId
+const generateUserId = () => {
+  const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  for (let i = 0; i < 9; i++) {
+    result += characters.charAt(Math.floor(Math.random() * characters.length));
+  }
+  return result;
+};
+
+// Generate a device fingerprint by hashing device info
+const generateDeviceFingerprint = (deviceInfo) => {
+  const data = `${deviceInfo.deviceName || ''}${deviceInfo.browser || ''}${deviceInfo.os || ''}${deviceInfo.deviceType || ''}`;
+  return crypto.createHash('md5').update(data).digest('hex');
+};
+
+// Generate a unique session token
+const generateSessionToken = () => {
+  return crypto.randomBytes(32).toString('hex');
+};
+
+// Setup Mailtrap client
+const mailtrapClient = new MailtrapClient({ token: process.env.MAILTRAP_TOKEN });
+const sender = {
+  email: process.env.MAILTRAP_SENDER_EMAIL,
+  name: process.env.MAILTRAP_SENDER_NAME,
+};
+
+// Send verification email
+const sendVerificationEmail = async (email, verificationCode) => {
+  try {
+    await mailtrapClient.send({
+      from: sender,
+      to: [{ email }],
+      subject: "Verify your email for Stringel",
+      html: `
+        <h1>Welcome to Stringel!</h1>
+        <p>Please verify your email by entering this code:</p>
+        <h2>${verificationCode}</h2>
+        <p>This code will expire in 1 hour.</p>
+      `,
+      category: "Email Verification",
+    });
+    return true;
+  } catch (error) {
+    console.error('Error sending verification email:', error);
+    return false;
+  }
+};
+
+// Register route
+router.post('/register', signupLimiter, async (req, res) => {
+  try {
+    const { email, password, deviceInfo } = req.body;
+    console.log('Register - Received deviceInfo:', deviceInfo);
+
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email already exists. Please login instead.',
+      });
+    }
+
+    const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
+
+    // Ensure lastLogin is a string before storing
+    const registrationData = {
+      password,
+      deviceInfo: {
+        deviceName: deviceInfo.deviceName,
+        browser: deviceInfo.browser,
+        os: deviceInfo.os,
+        deviceType: deviceInfo.deviceType,
+        location: { country: deviceInfo.location?.country || 'Unknown' },
+        lastLogin: deviceInfo.lastLogin ? new Date(deviceInfo.lastLogin).toISOString() : new Date().toISOString(),
+      },
+      verificationCode,
+    };
+
+    console.log('Register - Storing in Redis:', registrationData);
+
+    await redis.set(`verify:${email}`, JSON.stringify(registrationData), { EX: 3600 });
+
+    const emailSent = await sendVerificationEmail(email, verificationCode);
+    if (!emailSent) {
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to send verification email. Please try again.',
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Verification email sent. Please check your inbox.',
+    });
+  } catch (error) {
+    console.error('Registration error:', error.message, error.stack);
+    res.status(500).json({
+      success: false,
+      message: 'Server error during registration. Please try again.',
+      error: error.message,
+    });
+  }
+});
+
+// Verify email route
+router.post('/verify-email', async (req, res) => {
+  try {
+    const { email, code, deviceInfo } = req.body;
+    console.log('Verify - Received deviceInfo:', deviceInfo);
+
+    const registration = await redis.get(`verify:${email}`);
+    if (!registration) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email not found or verification expired. Please register again.',
+      });
+    }
+
+    console.log('Verify - Retrieved from Redis:', registration);
+
+    let parsedRegistration;
+    try {
+      parsedRegistration = JSON.parse(registration);
+    } catch (error) {
+      console.error('Failed to parse registration:', error.message, error.stack);
+      return res.status(500).json({
+        success: false,
+        message: 'Server error during verification. Invalid registration data.',
+        error: error.message,
+      });
+    }
+
+    const { password, verificationCode } = parsedRegistration;
+
+    if (verificationCode !== code) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid verification code. Please try again.',
+      });
+    }
+
+    const parser = new UAParser(deviceInfo.browser);
+    const ua = parser.getResult();
+
+    const deviceFingerprint = generateDeviceFingerprint(deviceInfo);
+    const userId = generateUserId();
+    const sessionToken = generateSessionToken();
+    const lastLogin = deviceInfo.lastLogin ? new Date(deviceInfo.lastLogin).toISOString() : new Date().toISOString();
+
+    const newUser = new User({
+      userId,
+      email,
+      password,
+      isVerified: true,
+      deviceFingerprint,
+      deviceInfo: [{
+        deviceName: deviceInfo.deviceName,
+        browser: ua.browser.name,
+        os: ua.os.name,
+        deviceType: ua.device.type || 'desktop',
+        location: { country: deviceInfo.location?.country || 'Unknown' },
+        lastLogin: lastLogin,
+      }],
+      botsCount: 0,
+      channelsCount: 0,
+    });
+
+    await newUser.save();
+
+    // Store simplified user data in Redis
+    const userData = {
+      email: newUser.email,
+      deviceFingerprint: newUser.deviceFingerprint,
+      botsCount: newUser.botsCount,
+      channelsCount: newUser.channelsCount,
+      lastLogin: lastLogin,
+      sessionToken: sessionToken,
+    };
+
+    await redis.set(`user:${userId}`, JSON.stringify(userData), { EX: 604800 });
+
+    await redis.del(`verify:${email}`);
+
+    res.status(201).json({
+      success: true,
+      message: 'Email verified successfully. Account created and logged in.',
+      token: sessionToken,
+      userId: userId,
+    });
+  } catch (error) {
+    console.error('Email verification error:', error.message, error.stack);
+    res.status(500).json({
+      success: false,
+      message: 'Server error during verification. Please try again.',
+      error: error.message,
+    });
+  }
+});
+
+// Resend verification email route
+router.post('/resend-verification', async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    const registration = await redis.get(`verify:${email}`);
+    if (!registration) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email not found or verification expired. Please register again.',
+      });
+    }
+
+    let parsedRegistration;
+    try {
+      parsedRegistration = JSON.parse(registration);
+    } catch (error) {
+      console.error('Failed to parse registration:', error.message);
+      return res.status(500).json({
+        success: false,
+        message: 'Server error during verification.',
+        error: error.message,
+      });
+    }
+
+    const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
+
+    const updatedRegistrationData = {
+      ...parsedRegistration,
+      verificationCode,
+    };
+
+    await redis.set(`verify:${email}`, JSON.stringify(updatedRegistrationData), { EX: 3600 });
+
+    const emailSent = await sendVerificationEmail(email, verificationCode);
+    if (!emailSent) {
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to send verification email. Please try again.',
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Verification email resent. Please check your inbox.',
+    });
+  } catch (error) {
+    console.error('Resend verification error:', error.message, error.stack);
+    res.status(500).json({
+      success: false,
+      message: 'Server error. Please try again.',
+      error: error.message,
+    });
+  }
+});
+
+// Login route
+router.post('/login', loginLimiter, async (req, res) => {
+  try {
+    const { email, password, deviceInfo } = req.body;
+
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email not found. Please register.',
+      });
+    }
+
+    if (!user.isVerified) {
+      const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
+      await redis.set(`verify:${email}`, JSON.stringify({
+        password: user.password,
+        deviceInfo: {
+          deviceName: deviceInfo.deviceName,
+          browser: deviceInfo.browser,
+          os: deviceInfo.os,
+          deviceType: deviceInfo.deviceType,
+          location: { country: deviceInfo.location?.country || 'Unknown' },
+          lastLogin: deviceInfo.lastLogin ? new Date(deviceInfo.lastLogin).toISOString() : new Date().toISOString(),
+        },
+        verificationCode,
+      }), { EX: 3600 });
+
+      await sendVerificationEmail(email, verificationCode);
+      return res.status(400).json({
+        success: false,
+        message: 'Email not verified. A new verification email has been sent.',
+      });
+    }
+
+    const isMatch = await user.comparePassword(password);
+    if (!isMatch) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid password. Please try again.',
+      });
+    }
+
+    const parser = new UAParser(deviceInfo.browser);
+    const ua = parser.getResult();
+
+    const deviceFingerprint = generateDeviceFingerprint(deviceInfo);
+    const sessionToken = generateSessionToken();
+    const lastLogin = deviceInfo.lastLogin ? new Date(deviceInfo.lastLogin).toISOString() : new Date().toISOString();
+
+    if (user.deviceFingerprint !== deviceFingerprint) {
+      user.deviceFingerprint = deviceFingerprint;
+    }
+
+    const existingDevice = user.deviceInfo.find(d => d.deviceName === deviceInfo.deviceName);
+    if (existingDevice) {
+      existingDevice.lastLogin = new Date();
+    } else {
+      user.deviceInfo.push({
+        deviceName: deviceInfo.deviceName,
+        browser: ua.browser.name,
+        os: ua.os.name,
+        deviceType: ua.device.type || 'desktop',
+        location: { country: deviceInfo.location?.country || 'Unknown' },
+        lastLogin: lastLogin,
+      });
+    }
+    await user.save();
+
+    // Store simplified user data in Redis
+    const userData = {
+      email: user.email,
+      deviceFingerprint: user.deviceFingerprint,
+      botsCount: user.botsCount,
+      channelsCount: user.channelsCount,
+      lastLogin: lastLogin,
+      sessionToken: sessionToken,
+    };
+
+    await redis.set(`user:${user.userId}`, JSON.stringify(userData), { EX: 604800 });
+
+    res.status(200).json({
+      success: true,
+      message: 'Login successful',
+      token: sessionToken,
+      userId: user.userId,
+    });
+  } catch (error) {
+    console.error('Login error:', error.message, error.stack);
+    res.status(500).json({
+      success: false,
+      message: 'Server error during login. Please try again.',
+      error: error.message,
+    });
+  }
+});
+
+// Session check route
+router.get('/session', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split('Bearer ')[1];
+    const userId = req.query.userId;
+
+    if (!token || !userId) {
+      return res.status(401).json({ success: false, message: 'Not logged in' });
+    }
+
+    const userData = await redis.get(`user:${userId}`);
+    if (!userData) {
+      return res.status(401).json({ success: false, message: 'Session expired' });
+    }
+
+    const parsedUserData = JSON.parse(userData);
+    if (parsedUserData.sessionToken !== token) {
+      return res.status(401).json({ success: false, message: 'Invalid token' });
+    }
+
+    res.json({ success: true, user: { email: parsedUserData.email, userId } });
+  } catch (error) {
+    console.error('Session check error:', error.message, error.stack);
+    res.status(500).json({
+      success: false,
+      message: 'Server error during session check',
+      error: error.message,
+    });
+  }
+});
+
+// Logout route
+router.post('/logout', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split('Bearer ')[1];
+    const userId = req.body.userId;
+
+    if (!token || !userId) {
+      return res.status(401).json({ success: false, message: 'Not logged in' });
+    }
+
+    const userData = await redis.get(`user:${userId}`);
+    if (!userData) {
+      return res.status(401).json({ success: false, message: 'Session expired' });
+    }
+
+    const parsedUserData = JSON.parse(userData);
+    if (parsedUserData.sessionToken !== token) {
+      return res.status(401).json({ success: false, message: 'Invalid token' });
+    }
+
+    await redis.del(`user:${userId}`);
+    res.json({ success: true, message: 'Logged out' });
+  } catch (error) {
+    console.error('Logout error:', error.message, error.stack);
+    res.status(500).json({
+      success: false,
+      message: 'Server error during logout',
+      error: error.message,
+    });
+  }
+});
+
+module.exports = router;
