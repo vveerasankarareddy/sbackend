@@ -1,11 +1,11 @@
 const express = require('express');
 const router = express.Router();
-const crypto = require('crypto');
 const { MailtrapClient } = require('mailtrap');
 const User = require('../models/User');
 const redis = require('../config/redis');
 const UAParser = require('ua-parser-js');
 const rateLimit = require('express-rate-limit');
+const { createSession } = require('./session');
 
 // Rate limiter for login and signup
 const loginLimiter = rateLimit({
@@ -33,12 +33,7 @@ const generateUserId = () => {
 // Generate a device fingerprint by hashing device info
 const generateDeviceFingerprint = (deviceInfo) => {
   const data = `${deviceInfo.deviceName || ''}${deviceInfo.browser || ''}${deviceInfo.os || ''}${deviceInfo.deviceType || ''}`;
-  return crypto.createHash('md5').update(data).digest('hex');
-};
-
-// Generate a unique session token
-const generateSessionToken = () => {
-  return crypto.randomBytes(32).toString('hex');
+  return require('crypto').createHash('md5').update(data).digest('hex');
 };
 
 // Setup Mailtrap client
@@ -74,7 +69,6 @@ const sendVerificationEmail = async (email, verificationCode) => {
 router.post('/register', signupLimiter, async (req, res) => {
   try {
     const { email, password, deviceInfo } = req.body;
-    console.log('Register - Received deviceInfo:', deviceInfo);
 
     const existingUser = await User.findOne({ email });
     if (existingUser) {
@@ -86,7 +80,6 @@ router.post('/register', signupLimiter, async (req, res) => {
 
     const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
 
-    // Ensure lastLogin is a string before storing
     const registrationData = {
       password,
       deviceInfo: {
@@ -99,8 +92,6 @@ router.post('/register', signupLimiter, async (req, res) => {
       },
       verificationCode,
     };
-
-    console.log('Register - Storing in Redis:', registrationData);
 
     await redis.set(`verify:${email}`, JSON.stringify(registrationData), { EX: 3600 });
 
@@ -130,7 +121,6 @@ router.post('/register', signupLimiter, async (req, res) => {
 router.post('/verify-email', async (req, res) => {
   try {
     const { email, code, deviceInfo } = req.body;
-    console.log('Verify - Received deviceInfo:', deviceInfo);
 
     const registration = await redis.get(`verify:${email}`);
     if (!registration) {
@@ -140,7 +130,6 @@ router.post('/verify-email', async (req, res) => {
       });
     }
 
-    console.log('Verify - Retrieved from Redis:', registration);
 
     let parsedRegistration;
     try {
@@ -168,7 +157,6 @@ router.post('/verify-email', async (req, res) => {
 
     const deviceFingerprint = generateDeviceFingerprint(deviceInfo);
     const userId = generateUserId();
-    const sessionToken = generateSessionToken();
     const lastLogin = deviceInfo.lastLogin ? new Date(deviceInfo.lastLogin).toISOString() : new Date().toISOString();
 
     const newUser = new User({
@@ -191,25 +179,23 @@ router.post('/verify-email', async (req, res) => {
 
     await newUser.save();
 
-    // Store simplified user data in Redis
     const userData = {
+      userId: newUser.userId,
       email: newUser.email,
       deviceFingerprint: newUser.deviceFingerprint,
       botsCount: newUser.botsCount,
       channelsCount: newUser.channelsCount,
       lastLogin: lastLogin,
-      sessionToken: sessionToken,
     };
 
-    await redis.set(`user:${userId}`, JSON.stringify(userData), { EX: 604800 });
+    const { sessionToken, userId: returnedUserId } = await createSession(res, userData);
 
     await redis.del(`verify:${email}`);
 
     res.status(201).json({
       success: true,
       message: 'Email verified successfully. Account created and logged in.',
-      token: sessionToken,
-      userId: userId,
+      userId: returnedUserId,
     });
   } catch (error) {
     console.error('Email verification error:', error.message, error.stack);
@@ -324,7 +310,6 @@ router.post('/login', loginLimiter, async (req, res) => {
     const ua = parser.getResult();
 
     const deviceFingerprint = generateDeviceFingerprint(deviceInfo);
-    const sessionToken = generateSessionToken();
     const lastLogin = deviceInfo.lastLogin ? new Date(deviceInfo.lastLogin).toISOString() : new Date().toISOString();
 
     if (user.deviceFingerprint !== deviceFingerprint) {
@@ -346,92 +331,27 @@ router.post('/login', loginLimiter, async (req, res) => {
     }
     await user.save();
 
-    // Store simplified user data in Redis
     const userData = {
+      userId: user.userId,
       email: user.email,
       deviceFingerprint: user.deviceFingerprint,
       botsCount: user.botsCount,
       channelsCount: user.channelsCount,
       lastLogin: lastLogin,
-      sessionToken: sessionToken,
     };
 
-    await redis.set(`user:${user.userId}`, JSON.stringify(userData), { EX: 604800 });
+    const { userId: returnedUserId } = await createSession(res, userData);
 
     res.status(200).json({
       success: true,
       message: 'Login successful',
-      token: sessionToken,
-      userId: user.userId,
+      userId: returnedUserId,
     });
   } catch (error) {
     console.error('Login error:', error.message, error.stack);
     res.status(500).json({
       success: false,
       message: 'Server error during login. Please try again.',
-      error: error.message,
-    });
-  }
-});
-
-// Session check route
-router.get('/session', async (req, res) => {
-  try {
-    const token = req.headers.authorization?.split('Bearer ')[1];
-    const userId = req.query.userId;
-
-    if (!token || !userId) {
-      return res.status(401).json({ success: false, message: 'Not logged in' });
-    }
-
-    const userData = await redis.get(`user:${userId}`);
-    if (!userData) {
-      return res.status(401).json({ success: false, message: 'Session expired' });
-    }
-
-    const parsedUserData = JSON.parse(userData);
-    if (parsedUserData.sessionToken !== token) {
-      return res.status(401).json({ success: false, message: 'Invalid token' });
-    }
-
-    res.json({ success: true, user: { email: parsedUserData.email, userId } });
-  } catch (error) {
-    console.error('Session check error:', error.message, error.stack);
-    res.status(500).json({
-      success: false,
-      message: 'Server error during session check',
-      error: error.message,
-    });
-  }
-});
-
-// Logout route
-router.post('/logout', async (req, res) => {
-  try {
-    const token = req.headers.authorization?.split('Bearer ')[1];
-    const userId = req.body.userId;
-
-    if (!token || !userId) {
-      return res.status(401).json({ success: false, message: 'Not logged in' });
-    }
-
-    const userData = await redis.get(`user:${userId}`);
-    if (!userData) {
-      return res.status(401).json({ success: false, message: 'Session expired' });
-    }
-
-    const parsedUserData = JSON.parse(userData);
-    if (parsedUserData.sessionToken !== token) {
-      return res.status(401).json({ success: false, message: 'Invalid token' });
-    }
-
-    await redis.del(`user:${userId}`);
-    res.json({ success: true, message: 'Logged out' });
-  } catch (error) {
-    console.error('Logout error:', error.message, error.stack);
-    res.status(500).json({
-      success: false,
-      message: 'Server error during logout',
       error: error.message,
     });
   }
