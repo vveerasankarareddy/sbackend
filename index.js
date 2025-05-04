@@ -33,8 +33,9 @@ if (cluster.isMaster) {
 } else {
   const app = express();
 
-  // MongoDB connection
+  // MongoDB connection with updated options (removed deprecated flags)
   mongoose.connect(process.env.MONGODB_URI);
+  
   const db = mongoose.connection;
   db.on('error', (err) => console.error('MongoDB connection error:', err));
   db.once('open', () => console.log(`Worker ${process.pid}: Connected to MongoDB`));
@@ -47,6 +48,7 @@ if (cluster.isMaster) {
   redisClient.on('error', (err) => console.error('Redis Client Error:', err));
   redisClient.on('connect', () => console.log(`Worker ${process.pid}: Connected to Upstash Redis`));
 
+  // Connect to Redis
   (async () => {
     await redisClient.connect();
   })();
@@ -54,6 +56,10 @@ if (cluster.isMaster) {
   // Round-robin middleware simulation (for logging only in a clustered setup)
   const endpointCounters = {
     '/api/telegram/update-bot-token': 0,
+    '/api/telegram/get-bot-data': 0,
+    '/api/telegram/get-user-bots': 0,
+    '/api/telegram/delete-bot': 0,
+    '/api/telegram/refresh-bot': 0,
   };
 
   const roundRobinMiddleware = (req, res, next) => {

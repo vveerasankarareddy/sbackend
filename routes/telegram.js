@@ -1,207 +1,391 @@
 const express = require('express');
 const router = express.Router();
-const User = require('../models/User');
-const TelegramChannel = require('../models/telegram');
 const axios = require('axios');
-const { validateSession } = require('./session');
+const mongoose = require('mongoose');
 
-// Utility to validate Telegram bot token format
-const validateBotTokenFormat = (botToken) => {
-  const botTokenRegex = /^\d{8,10}:[A-Za-z0-9_-]{35}$/;
-  return botTokenRegex.test(botToken);
-};
+// TelegramChannel model schema definition if not defined elsewhere
+const telegramChannelSchema = new mongoose.Schema({
+  userId: { type: String, required: true },
+  botToken: { type: String, required: true, unique: true },
+  botName: { type: String, required: true },
+  webhookUrl: { type: String, default: null },
+  status: { type: String, enum: ['live', 'working', 'not working'], default: 'working' },
+  usage: {
+    messagesSent: { type: Number, default: 0 },
+    activeUsers: { type: Number, default: 0 },
+    errors: { type: Number, default: 0 }
+  },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+});
 
-// Utility to sanitize webhook URL
-const sanitizeWebhookUrl = (url) => {
-  if (!url) return '';
+// Register model if it doesn't exist
+let TelegramChannel;
+try {
+  TelegramChannel = mongoose.model('TelegramChannel');
+} catch (e) {
+  TelegramChannel = mongoose.model('TelegramChannel', telegramChannelSchema);
+}
+
+/**
+ * Middleware to check if the user is authenticated
+ */
+const isAuthenticated = async (req, res, next) => {
   try {
-    new URL(url);
-    return url;
+    // Get session token from cookies
+    const sessionToken = req.cookies.sessionToken;
+    
+    if (!sessionToken) {
+      return res.status(401).json({ success: false, message: 'Authentication required' });
+    }
+    
+    // Check if session exists in Redis
+    const userId = await req.redisClient.get(`session:${sessionToken}`);
+    
+    if (!userId) {
+      return res.status(401).json({ success: false, message: 'Invalid or expired session' });
+    }
+    
+    // Attach userId to request for use in route handlers
+    req.userId = userId;
+    next();
   } catch (error) {
-    console.warn('Invalid webhookUrl, defaulting to empty string:', url);
-    return '';
+    console.error('Authentication error:', error);
+    res.status(500).json({ success: false, message: 'Authentication error' });
   }
 };
 
-// Function to validate Telegram bot token via API
-const validateTelegramBotToken = async (botToken) => {
+/**
+ * Validates a Telegram bot token
+ * @param {string} botToken - Token to validate
+ * @returns {Promise<boolean>} - Whether the token is valid
+ */
+async function validateBotToken(botToken) {
   try {
-    const response = await axios.get(`https://api.telegram.org/bot${botToken}/getMe`, { timeout: 5000 });
-    if (response.data.ok && response.data.result) {
-      return { isValid: true, botName: response.data.result.username };
-    }
-    return { isValid: false, message: 'Invalid bot token response' };
+    const response = await axios.get(`https://api.telegram.org/bot${botToken}/getMe`);
+    return response.data.ok === true;
   } catch (error) {
-    console.error('Telegram bot token validation failed:', {
-      message: error.message,
-      response: error.response?.data,
-      stack: error.stack,
-    });
-    return { isValid: false, message: 'Failed to validate bot token' };
-  }
-};
-
-// Function to check for duplicate bot token
-const checkDuplicateBotToken = async (botToken) => {
-  try {
-    const existingChannel = await TelegramChannel.findOne({ botToken }).exec();
-    if (existingChannel) {
-      console.log('Duplicate bot token found in TelegramChannel:', botToken);
-      return true;
-    }
-    const userWithToken = await User.findOne({ 'channels.botToken': botToken }).exec();
-    if (userWithToken) {
-      console.log('Duplicate bot token found in User channels:', botToken);
-      return true;
-    }
     return false;
-  } catch (error) {
-    console.error('Error checking duplicate bot token:', {
-      message: error.message,
-      stack: error.stack,
-    });
-    throw new Error('Failed to check for duplicate bot token');
   }
-};
+}
 
-// Function to update channel count in User and Redis
-const updateChannelCount = async (redisClient, userId, sessionToken) => {
+/**
+ * Fetches data from a Telegram bot and stores/updates it in the database
+ * @param {string} botToken - The bot's token
+ * @param {string} userId - ID of the user who owns the bot
+ * @param {string} [customBotName] - Optional custom name
+ * @returns {Promise<Object>} - The bot data object
+ */
+async function fetchTelegramBotDataAndStore(botToken, userId, customBotName = null) {
   try {
-    const user = await User.findOne({ userId }).exec();
-    if (!user) throw new Error(`User not found for channel count update: ${userId}`);
-
-    const channelsCount = user.channels.length;
-    console.log('Calculated channels count:', channelsCount);
-
-    await User.findOneAndUpdate(
-      { userId },
-      { $set: { channelsCount } },
-      { new: true, runValidators: true }
-    ).exec();
-
-    const sessionData = await redisClient.get(`session:${sessionToken}`);
-    if (!sessionData) throw new Error('Session not found in Redis for update');
-
-    let session;
-    try {
-      session = JSON.parse(sessionData);
-    } catch (error) {
-      throw new Error('Failed to parse Redis session data');
+    // 1. Get bot information using Telegram API
+    const botInfo = await axios.get(`https://api.telegram.org/bot${botToken}/getMe`);
+    
+    if (!botInfo.data.ok) {
+      throw new Error('Failed to fetch bot info: ' + botInfo.data.description);
     }
+    
+    const telegramBotData = botInfo.data.result;
+    
+    // 2. Get webhook info
+    const webhookInfo = await axios.get(`https://api.telegram.org/bot${botToken}/getWebhookInfo`);
+    const webhookUrl = webhookInfo.data.ok ? webhookInfo.data.result.url : null;
+    
+    // 3. Check if webhook is set - if so, we can't use getUpdates directly
+    // Instead of trying to get updates when webhook is active (which causes 409 conflict),
+    // we'll either get stats another way or disable the webhook first if needed
+    let uniqueUsers = new Set();
+    let messageCount = 0;
+    let errorCount = 0;
 
-    session.channelsCount = channelsCount;
-    await redisClient.setEx(`session:${sessionToken}`, 604800, JSON.stringify(session));
-    console.log('Redis updated with channelsCount:', channelsCount);
+    // Only try to get updates if no webhook is set
+    if (!webhookUrl) {
+      try {
+        const updates = await axios.get(`https://api.telegram.org/bot${botToken}/getUpdates?limit=100`);
+        
+        if (updates.data.ok) {
+          messageCount = updates.data.result.length;
+          
+          updates.data.result.forEach(update => {
+            if (update.message && update.message.from) {
+              uniqueUsers.add(update.message.from.id);
+            } else if (update.callback_query && update.callback_query.from) {
+              uniqueUsers.add(update.callback_query.from.id);
+            }
+            
+            if (update.message && update.message.text === '/error') {
+              errorCount++;
+            }
+          });
+        }
+      } catch (updateError) {
+        console.warn(`Could not get updates for bot ${botToken}: ${updateError.message}`);
+        // Continue with the bot registration, just with fewer stats
+      }
+    }
+    
+    // 4. Find or create the TelegramChannel document
+    let telegramChannel = await TelegramChannel.findOne({ botToken });
+    
+    if (!telegramChannel) {
+      // Create new document if it doesn't exist
+      telegramChannel = new TelegramChannel({
+        userId,
+        botToken,
+        botName: customBotName || telegramBotData.first_name,
+        webhookUrl,
+        usage: {
+          messagesSent: messageCount,
+          activeUsers: uniqueUsers.size,
+          errors: errorCount
+        },
+        status: webhookUrl ? 'live' : 'working'
+      });
+    } else {
+      // Update existing document
+      telegramChannel.botName = customBotName || telegramBotData.first_name;
+      telegramChannel.webhookUrl = webhookUrl;
+      
+      // Only update message count if we successfully retrieved updates
+      if (!webhookUrl) {
+        telegramChannel.usage.messagesSent += messageCount;
+        telegramChannel.usage.activeUsers = Math.max(uniqueUsers.size, telegramChannel.usage.activeUsers);
+        telegramChannel.usage.errors += errorCount;
+      }
+      
+      telegramChannel.status = webhookUrl ? 'live' : 'working';
+      telegramChannel.updatedAt = Date.now();
+    }
+    
+    // 5. Save the document to the database
+    await telegramChannel.save();
+    console.log(`Data for bot ${telegramChannel.botName} successfully stored/updated`);
+    
+    return telegramChannel;
   } catch (error) {
-    console.error('Error updating channel count:', {
-      message: error.message,
-      stack: error.stack,
-    });
+    console.error('Error fetching or storing Telegram bot data:', error.message);
+    
+    // If the error is related to the bot token being invalid, we still want to record this
+    if (error.response && error.response.data && error.response.data.description === 'Unauthorized') {
+      // Create or update with error status
+      try {
+        let telegramChannel = await TelegramChannel.findOne({ botToken });
+        
+        if (!telegramChannel) {
+          telegramChannel = new TelegramChannel({
+            userId,
+            botToken,
+            botName: customBotName || 'Invalid Bot',
+            status: 'not working',
+            usage: {
+              errors: 1
+            }
+          });
+        } else {
+          telegramChannel.status = 'not working';
+          telegramChannel.usage.errors += 1;
+          telegramChannel.updatedAt = Date.now();
+        }
+        
+        await telegramChannel.save();
+        console.log(`Error status recorded for invalid bot token`);
+        return telegramChannel;
+      } catch (dbError) {
+        console.error('Failed to record error status in database:', dbError);
+        throw dbError;
+      }
+    }
+    
     throw error;
   }
-};
+}
 
-// Main route for updating bot token and creating channel
-router.post('/telegram/update-bot-token', validateSession, async (req, res) => {
-  const requestStartTime = Date.now();
-  const requestId = mongoose.Types.ObjectId().toHexString();
-  console.log(`[Request ${requestId}] Starting /telegram/update-bot-token on worker ${req.workerIndex}`);
-
+/**
+ * Retrieves all bots for a specific user
+ * @param {string} userId - The user ID
+ * @returns {Promise<Array>} - Array of user's bots
+ */
+async function getUserBots(userId) {
   try {
-    const { botToken, webhookUrl } = req.body;
-    const { redisClient, db } = req;
-
-    if (!redisClient) throw new Error('Redis client unavailable');
-    if (!sessionToken) throw new Error('Session token missing');
-
-    if (!botToken || !validateBotTokenFormat(botToken)) {
-      throw new Error('Invalid bot token format');
-    }
-
-    const sanitizedWebhookUrl = sanitizeWebhookUrl(webhookUrl);
-
-    const sessionData = await redisClient.get(`session:${sessionToken}`);
-    if (!sessionData) throw new Error('Session expired or invalid');
-
-    let session;
-    try {
-      session = JSON.parse(sessionData);
-    } catch (error) {
-      throw new Error('Invalid session data');
-    }
-
-    const redisUserId = session.userId;
-    console.log(`[Request ${requestId}] Retrieved userId from Redis:`, redisUserId);
-
-    const user = await User.findOne({ userId: redisUserId }).exec();
-    if (!user) throw new Error('User not found');
-
-    const dbUserId = user.userId;
-    console.log(`[Request ${requestId}] Using userId from database:`, dbUserId);
-
-    const tokenValidation = await validateTelegramBotToken(botToken);
-    if (!tokenValidation.isValid) throw new Error(tokenValidation.message);
-
-    const botName = tokenValidation.botName;
-
-    const isDuplicate = await checkDuplicateBotToken(botToken);
-    if (isDuplicate) throw new Error('This bot token is already in use');
-
-    const sessionMongo = await db.startSession();
-    try {
-      await sessionMongo.withTransaction(async () => {
-        const updatedUser = await User.findOneAndUpdate(
-          { userId: dbUserId },
-          {
-            $push: {
-              channels: {
-                channelType: 'Telegram',
-                channelUserId: dbUserId,
-                botToken,
-                botName,
-                usage: { messagesSent: 0, activeUsers: 0, errors: 0 },
-              }
-            },
-            $inc: { botsCount: 1 }
-          },
-          { new: true, runValidators: true, session: sessionMongo }
-        ).exec();
-
-        if (!updatedUser) throw new Error('User update failed');
-
-        const telegramChannel = new TelegramChannel({
-          userId: dbUserId,
-          channelUserId: dbUserId,
-          botToken,
-          botName,
-          webhookUrl: sanitizedWebhookUrl,
-          status: 'working'
-        });
-
-        await telegramChannel.save({ session: sessionMongo });
-      });
-
-      await updateChannelCount(redisClient, dbUserId, sessionToken);
-
-      console.log(`[Request ${requestId}] Successfully created channel in ${Date.now() - requestStartTime}ms`);
-      res.status(200).json({ success: true, message: 'Bot token updated and channel created', botName });
-    } catch (error) {
-      throw error;
-    } finally {
-      await sessionMongo.endSession();
-    }
+    const userBots = await TelegramChannel.find({ userId });
+    return userBots;
   } catch (error) {
-    console.error(`[Request ${requestId}] Server error in /telegram/update-bot-token:`, {
-      message: error.message,
-      stack: error.stack,
-      duration: `${Date.now() - requestStartTime}ms`,
-      worker: req.workerIndex,
+    console.error(`Error retrieving bots for user ${userId}:`, error);
+    throw error;
+  }
+}
+
+/**
+ * Update or create a Telegram bot with the provided token
+ */
+router.post('/telegram/update-bot-token', isAuthenticated, async (req, res) => {
+  try {
+    const { botToken, botName } = req.body;
+    const userId = req.userId;
+    
+    if (!botToken) {
+      return res.status(400).json({ success: false, message: 'Bot token is required' });
+    }
+    
+    // Validate bot token
+    const isValid = await validateBotToken(botToken);
+    if (!isValid) {
+      return res.status(400).json({ success: false, message: 'Invalid Telegram bot token' });
+    }
+    
+    // Fetch data and store in database
+    const telegramData = await fetchTelegramBotDataAndStore(botToken, userId, botName);
+    
+    // Return success with bot info
+    res.json({ 
+      success: true, 
+      message: 'Bot token updated successfully',
+      botId: telegramData._id,
+      botName: telegramData.botName,
+      status: telegramData.status
     });
-    res.status(error.message.includes('already in use') ? 400 : 500).json({
-      success: false,
-      message: error.message || 'Server error',
-    });
+  } catch (error) {
+    console.error('Error updating bot token:', error);
+    res.status(500).json({ success: false, message: 'Failed to update bot token' });
   }
 });
 
-module.exports = router;
+/**
+ * Get data for a specific bot
+ */
+router.get('/telegram/get-bot-data/:botId', isAuthenticated, async (req, res) => {
+  try {
+    const { botId } = req.params;
+    const userId = req.userId;
+    
+    // Find the bot and ensure it belongs to the user
+    const botData = await TelegramChannel.findOne({ _id: botId, userId });
+    
+    if (!botData) {
+      return res.status(404).json({ success: false, message: 'Bot not found or access denied' });
+    }
+    
+    // Return bot data
+    res.json({ success: true, data: botData });
+  } catch (error) {
+    console.error('Error getting bot data:', error);
+    res.status(500).json({ success: false, message: 'Failed to get bot data' });
+  }
+});
+
+/**
+ * Get all bots for the authenticated user
+ */
+router.get('/telegram/get-user-bots', isAuthenticated, async (req, res) => {
+  try {
+    const userId = req.userId;
+    
+    // Get all bots for this user
+    const userBots = await getUserBots(userId);
+    
+    res.json({ 
+      success: true, 
+      data: userBots,
+      totalBots: userBots.length
+    });
+  } catch (error) {
+    console.error('Error getting user bots:', error);
+    res.status(500).json({ success: false, message: 'Failed to get user bots' });
+  }
+});
+
+/**
+ * Delete a specific bot
+ */
+router.delete('/telegram/delete-bot/:botId', isAuthenticated, async (req, res) => {
+  try {
+    const { botId } = req.params;
+    const userId = req.userId;
+    
+    // Find and delete the bot, ensuring it belongs to the user
+    const result = await TelegramChannel.findOneAndDelete({ _id: botId, userId });
+    
+    if (!result) {
+      return res.status(404).json({ success: false, message: 'Bot not found or access denied' });
+    }
+    
+    res.json({ success: true, message: 'Bot deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting bot:', error);
+    res.status(500).json({ success: false, message: 'Failed to delete bot' });
+  }
+});
+
+/**
+ * Refresh bot data from Telegram API
+ */
+router.post('/telegram/refresh-bot/:botId', isAuthenticated, async (req, res) => {
+  try {
+    const { botId } = req.params;
+    const userId = req.userId;
+    
+    // Find the bot and ensure it belongs to the user
+    const botData = await TelegramChannel.findOne({ _id: botId, userId });
+    
+    if (!botData) {
+      return res.status(404).json({ success: false, message: 'Bot not found or access denied' });
+    }
+    
+    // Refresh the bot data
+    const refreshedData = await fetchTelegramBotDataAndStore(botData.botToken, userId, botData.botName);
+    
+    res.json({ 
+      success: true, 
+      message: 'Bot data refreshed successfully',
+      data: refreshedData
+    });
+  } catch (error) {
+    console.error('Error refreshing bot data:', error);
+    res.status(500).json({ success: false, message: 'Failed to refresh bot data' });
+  }
+});
+
+/**
+ * Remove webhook for a specific bot (useful when conflict occurs)
+ */
+router.post('/telegram/remove-webhook/:botId', isAuthenticated, async (req, res) => {
+  try {
+    const { botId } = req.params;
+    const userId = req.userId;
+    
+    // Find the bot and ensure it belongs to the user
+    const botData = await TelegramChannel.findOne({ _id: botId, userId });
+    
+    if (!botData) {
+      return res.status(404).json({ success: false, message: 'Bot not found or access denied' });
+    }
+    
+    // Remove webhook
+    const response = await axios.get(`https://api.telegram.org/bot${botData.botToken}/deleteWebhook`);
+    
+    if (!response.data.ok) {
+      return res.status(500).json({ 
+        success: false, 
+        message: 'Failed to remove webhook',
+        description: response.data.description 
+      });
+    }
+    
+    // Update bot data
+    botData.webhookUrl = null;
+    botData.status = 'working';
+    botData.updatedAt = Date.now();
+    await botData.save();
+    
+    res.json({ 
+      success: true, 
+      message: 'Webhook removed successfully',
+      data: botData
+    });
+  } catch (error) {
+    console.error('Error removing webhook:', error);
+    res.status(500).json({ success: false, message: 'Failed to remove webhook' });
+  }
+});
+
+module.exports = router;  
