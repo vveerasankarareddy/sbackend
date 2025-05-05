@@ -2,20 +2,19 @@ const express = require('express');
 const router = express.Router();
 const { MailtrapClient } = require('mailtrap');
 const User = require('../models/User');
-const redis = require('../config/redis');
 const UAParser = require('ua-parser-js');
 const rateLimit = require('express-rate-limit');
 const { createSession } = require('./session');
 
 // Rate limiter for login and signup
 const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
+  windowMs: 15 * 60 * 1000, // level minutes
   max: 5,
   message: 'Too many login attempts, please try again later.',
 });
 
 const signupLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
+  windowMs: 15 * 60 * 1000, // 15 minutes
   max: 5,
   message: 'Too many signup attempts, please try again later.',
 });
@@ -70,6 +69,13 @@ router.post('/register', signupLimiter, async (req, res) => {
   try {
     const { email, password, deviceInfo } = req.body;
 
+    if (!req.redisClient || !req.redisClient.isOpen) {
+      return res.status(500).json({
+        success: false,
+        message: 'Server error: Redis client is not connected.'
+      });
+    }
+
     const existingUser = await User.findOne({ email });
     if (existingUser) {
       return res.status(400).json({
@@ -93,7 +99,7 @@ router.post('/register', signupLimiter, async (req, res) => {
       verificationCode,
     };
 
-    await redis.set(`verify:${email}`, JSON.stringify(registrationData), { EX: 3600 });
+    await req.redisClient.set(`verify:${email}`, JSON.stringify(registrationData), { EX: 3600 });
 
     const emailSent = await sendVerificationEmail(email, verificationCode);
     if (!emailSent) {
@@ -122,14 +128,20 @@ router.post('/verify-email', async (req, res) => {
   try {
     const { email, code, deviceInfo } = req.body;
 
-    const registration = await redis.get(`verify:${email}`);
+    if (!req.redisClient || !req.redisClient.isOpen) {
+      return res.status(500).json({
+        success: false,
+        message: 'Server error: Redis client is not connected.'
+      });
+    }
+
+    const registration = await req.redisClient.get(`verify:${email}`);
     if (!registration) {
       return res.status(400).json({
         success: false,
         message: 'Email not found or verification expired. Please register again.',
       });
     }
-
 
     let parsedRegistration;
     try {
@@ -175,6 +187,25 @@ router.post('/verify-email', async (req, res) => {
       }],
       botsCount: 0,
       channelsCount: 0,
+      settings: {
+        timezone: 'UTC',
+        language: 'en',
+        theme: 'light',
+      },
+      notificationsPrefs: {
+        email: {
+          enabled: true,
+          types: ['collaboration', 'workflow', 'limit'],
+        },
+        inApp: {
+          enabled: true,
+          types: ['change', 'limit'],
+        },
+        push: {
+          enabled: false,
+          types: ['error'],
+        },
+      }
     });
 
     await newUser.save();
@@ -188,15 +219,28 @@ router.post('/verify-email', async (req, res) => {
       lastLogin: lastLogin,
     };
 
-    const { sessionToken, userId: returnedUserId } = await createSession(res, userData);
+    try {
+      const { sessionToken, userId: returnedUserId } = await createSession(res, userData, req.redisClient);
+      
+      await req.redisClient.del(`verify:${email}`);
 
-    await redis.del(`verify:${email}`);
-
-    res.status(201).json({
-      success: true,
-      message: 'Email verified successfully. Account created and logged in.',
-      userId: returnedUserId,
-    });
+      res.status(201).json({
+        success: true,
+        message: 'Email verified successfully. Account created and logged in.',
+        userId: returnedUserId,
+      });
+    } catch (sessionError) {
+      console.error('Session creation error:', sessionError.message, sessionError.stack);
+      
+      // Even if session creation fails, the user account has been created
+      // We can still return a success but with a login required message
+      res.status(201).json({
+        success: true,
+        message: 'Email verified and account created. Please log in.',
+        userId: userData.userId,
+        loginRequired: true,
+      });
+    }
   } catch (error) {
     console.error('Email verification error:', error.message, error.stack);
     res.status(500).json({
@@ -212,7 +256,14 @@ router.post('/resend-verification', async (req, res) => {
   try {
     const { email } = req.body;
 
-    const registration = await redis.get(`verify:${email}`);
+    if (!req.redisClient || !req.redisClient.isOpen) {
+      return res.status(500).json({
+        success: false,
+        message: 'Server error: Redis client is not connected.'
+      });
+    }
+
+    const registration = await req.redisClient.get(`verify:${email}`);
     if (!registration) {
       return res.status(400).json({
         success: false,
@@ -239,7 +290,7 @@ router.post('/resend-verification', async (req, res) => {
       verificationCode,
     };
 
-    await redis.set(`verify:${email}`, JSON.stringify(updatedRegistrationData), { EX: 3600 });
+    await req.redisClient.set(`verify:${email}`, JSON.stringify(updatedRegistrationData), { EX: 3600 });
 
     const emailSent = await sendVerificationEmail(email, verificationCode);
     if (!emailSent) {
@@ -268,6 +319,13 @@ router.post('/login', loginLimiter, async (req, res) => {
   try {
     const { email, password, deviceInfo } = req.body;
 
+    if (!req.redisClient || !req.redisClient.isOpen) {
+      return res.status(500).json({
+        success: false,
+        message: 'Server error: Redis client is not connected.'
+      });
+    }
+
     const user = await User.findOne({ email });
     if (!user) {
       return res.status(400).json({
@@ -278,7 +336,7 @@ router.post('/login', loginLimiter, async (req, res) => {
 
     if (!user.isVerified) {
       const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
-      await redis.set(`verify:${email}`, JSON.stringify({
+      await req.redisClient.set(`verify:${email}`, JSON.stringify({
         password: user.password,
         deviceInfo: {
           deviceName: deviceInfo.deviceName,
@@ -340,18 +398,153 @@ router.post('/login', loginLimiter, async (req, res) => {
       lastLogin: lastLogin,
     };
 
-    const { userId: returnedUserId } = await createSession(res, userData);
+    try {
+      const { userId: returnedUserId } = await createSession(res, userData, req.redisClient);
 
-    res.status(200).json({
-      success: true,
-      message: 'Login successful',
-      userId: returnedUserId,
-    });
+      res.status(200).json({
+        success: true,
+        message: 'Login successful',
+        userId: returnedUserId,
+      });
+    } catch (sessionError) {
+      console.error('Session creation error during login:', sessionError.message, sessionError.stack);
+      
+      // Return a partial success but let client know there's a session issue
+      res.status(200).json({
+        success: true,
+        message: 'Authenticated successfully, but session creation failed. Some features may be limited.',
+        userId: userData.userId,
+        sessionWarning: true,
+      });
+    }
   } catch (error) {
     console.error('Login error:', error.message, error.stack);
     res.status(500).json({
       success: false,
       message: 'Server error during login. Please try again.',
+      error: error.message,
+    });
+  }
+});
+
+// Logout route
+router.post('/logout', async (req, res) => {
+  try {
+    // Clear the session cookie
+    res.clearCookie('sessionToken');
+    
+    // If we have userId and sessionToken, also remove from Redis
+    if (req.userId && req.sessionToken && req.redisClient && req.redisClient.isOpen) {
+      await req.redisClient.del(`${req.userId}:${req.sessionToken}`);
+    }
+    
+    res.status(200).json({
+      success: true,
+      message: 'Logged out successfully',
+    });
+  } catch (error) {
+    console.error('Logout error:', error.message, error.stack);
+    res.status(500).json({
+      success: false,
+      message: 'Server error during logout. Please try again.',
+      error: error.message,
+    });
+  }
+});
+
+// Get user profile route
+router.get('/profile', async (req, res) => {
+  try {
+    if (!req.userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Unauthorized. Please login.',
+      });
+    }
+
+    const user = await User.findOne({ userId: req.userId }).select('-password');
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found.',
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      user: {
+        userId: user.userId,
+        email: user.email,
+        deviceInfo: user.deviceInfo,
+        botsCount: user.botsCount,
+        channelsCount: user.channelsCount,
+        settings: user.settings,
+        notificationsPrefs: user.notificationsPrefs,
+        createdAt: user.createdAt,
+        updatedAt: user.updatedAt,
+      },
+    });
+  } catch (error) {
+    console.error('Get profile error:', error.message, error.stack);
+    res.status(500).json({
+      success: false,
+      message: 'Server error. Please try again.',
+      error: error.message,
+    });
+  }
+});
+
+// Update user profile route
+router.put('/profile', async (req, res) => {
+  try {
+    if (!req.userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Unauthorized. Please login.',
+      });
+    }
+
+    const { settings, notificationsPrefs } = req.body;
+
+    const user = await User.findOne({ userId: req.userId });
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found.',
+      });
+    }
+
+    if (settings) {
+      user.settings = {
+        ...user.settings,
+        ...settings,
+      };
+    }
+
+    if (notificationsPrefs) {
+      user.notificationsPrefs = {
+        ...user.notificationsPrefs,
+        ...notificationsPrefs,
+      };
+    }
+
+    await user.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Profile updated successfully',
+      user: {
+        userId: user.userId,
+        email: user.email,
+        settings: user.settings,
+        notificationsPrefs: user.notificationsPrefs,
+      },
+    });
+  } catch (error) {
+    console.error('Update profile error:', error.message, error.stack);
+    res.status(500).json({
+      success: false,
+      message: 'Server error. Please try again.',
       error: error.message,
     });
   }

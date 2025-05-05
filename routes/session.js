@@ -1,81 +1,101 @@
-const express = require('express');
-const router = express.Router();
 const crypto = require('crypto');
-const redis = require('../config/redis');
 
-// Generate a unique session token
+// Generate a secure random session token
 const generateSessionToken = () => {
-  return crypto.randomBytes(32).toString('hex');
+  return crypto.randomBytes(48).toString('hex');
 };
 
-// Middleware to validate session token from cookie
+// Create a new session and set cookie
+const createSession = async (res, userData, redisClient) => {
+  try {
+    if (!redisClient || !redisClient.isOpen) {
+      throw new Error('Redis client is not connected');
+    }
+
+    const sessionToken = generateSessionToken();
+    const sessionData = {
+      userId: userData.userId,
+      email: userData.email,
+      deviceFingerprint: userData.deviceFingerprint,
+      lastLogin: userData.lastLogin,
+      createdAt: new Date().toISOString(),
+    };
+
+    // Store session in Redis with the key as userId:sessionToken
+    await redisClient.set(`${userData.userId}:${sessionToken}`, JSON.stringify(sessionData), { EX: 7 * 24 * 60 * 60 });
+
+    // Set secure HTTP-only cookie
+    res.cookie('sessionToken', sessionToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days in milliseconds
+    });
+
+    return { sessionToken, userId: userData.userId };
+  } catch (error) {
+    console.error('Session creation error:', error.message, error.stack);
+    throw new Error('Failed to create session');
+  }
+};
+
+// Validate session middleware
 const validateSession = async (req, res, next) => {
   try {
     const sessionToken = req.cookies.sessionToken;
+
     if (!sessionToken) {
-      return res.status(401).json({ success: false, message: 'Unauthorized: No session token' });
+      req.userId = null;
+      return next();
     }
 
-    const sessionData = await redis.get(`session:${sessionToken}`);
+    // Extract userId from the sessionToken cookie if possible
+    // This is a workaround since we need userId to construct the Redis key
+    const allSessions = await req.redisClient.keys('*:' + sessionToken);
+    if (!allSessions || allSessions.length === 0) {
+      req.userId = null;
+      return next();
+    }
+
+    // Get the userId from the first part of the key (before :)
+    const redisCacheKey = allSessions[0];
+    const userId = redisCacheKey.split(':')[0];
+
+    const sessionData = await req.redisClient.get(redisCacheKey);
     if (!sessionData) {
-      return res.status(401).json({ success: false, message: 'Session expired or invalid' });
+      req.userId = null;
+      return next();
     }
 
-    req.session = JSON.parse(sessionData);
+    const session = JSON.parse(sessionData);
+    req.userId = session.userId;
+    req.userEmail = session.email;
+    req.sessionToken = sessionToken;
+
+    // Refresh session expiry (rolling expiration)
+    await req.redisClient.expire(redisCacheKey, 7 * 24 * 60 * 60);
+
     next();
   } catch (error) {
     console.error('Session validation error:', error.message, error.stack);
-    res.status(500).json({ success: false, message: 'Server error during session validation', error: error.message });
+    req.userId = null;
+    next();
   }
 };
 
-// Create a session and set cookie
-const createSession = async (res, userData) => {
-  const sessionToken = generateSessionToken();
-  const sessionData = {
-    userId: userData.userId,
-    email: userData.email,
-    deviceFingerprint: userData.deviceFingerprint,
-    botsCount: userData.botsCount,
-    channelsCount: userData.channelsCount,
-    lastLogin: userData.lastLogin,
-  };
-
-  await redis.set(`session:${sessionToken}`, JSON.stringify(sessionData), { EX: 604800 }); // 7 days
-
-  res.cookie('sessionToken', sessionToken, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'strict',
-    maxAge: 604800000, // 7 days in milliseconds
-  });
-
-  return { sessionToken, userId: userData.userId };
-};
-
-// Session check route
-router.get('/check', validateSession, (req, res) => {
-  res.json({
-    success: true,
-    user: { email: req.session.email, userId: req.session.userId },
-  });
-});
-
-// Logout route
-router.post('/logout', validateSession, async (req, res) => {
-  try {
-    const sessionToken = req.cookies.sessionToken;
-    await redis.del(`session:${sessionToken}`);
-    res.clearCookie('sessionToken');
-    res.json({ success: true, message: 'Logged out' });
-  } catch (error) {
-    console.error('Logout error:', error.message, error.stack);
-    res.status(500).json({
+// Authentication middleware - requires valid session
+const requireAuth = async (req, res, next) => {
+  if (!req.userId) {
+    return res.status(401).json({
       success: false,
-      message: 'Server error during logout',
-      error: error.message,
+      message: 'Authentication required. Please log in.',
     });
   }
-});
+  next();
+};
 
-module.exports = { router, createSession, validateSession };
+module.exports = {
+  createSession,
+  validateSession,
+  requireAuth,
+};

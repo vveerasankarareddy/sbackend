@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const axios = require('axios');
 const mongoose = require('mongoose');
+const UserUpdateService = require('../services/userchannelsupdateservice');
 
 // TelegramChannel model schema definition if not defined elsewhere
 const telegramChannelSchema = new mongoose.Schema({
@@ -29,6 +30,7 @@ try {
 
 /**
  * Middleware to check if the user is authenticated
+ * Uses the session storage pattern: ${userId}:${sessionToken}
  */
 const isAuthenticated = async (req, res, next) => {
   try {
@@ -39,15 +41,35 @@ const isAuthenticated = async (req, res, next) => {
       return res.status(401).json({ success: false, message: 'Authentication required' });
     }
     
-    // Check if session exists in Redis
-    const userId = await req.redisClient.get(`session:${sessionToken}`);
+    // Find all sessions with this token (should be only one)
+    const allSessions = await req.redisClient.keys('*:' + sessionToken);
     
-    if (!userId) {
+    if (!allSessions || allSessions.length === 0) {
       return res.status(401).json({ success: false, message: 'Invalid or expired session' });
     }
     
+    // Get the userId from the first part of the key (before :)
+    const redisCacheKey = allSessions[0];
+    const userId = redisCacheKey.split(':')[0];
+    
+    // Verify session data exists
+    const sessionData = await req.redisClient.get(redisCacheKey);
+    
+    if (!sessionData) {
+      return res.status(401).json({ success: false, message: 'Invalid or expired session' });
+    }
+    
+    // Parse session data
+    const session = JSON.parse(sessionData);
+    
     // Attach userId to request for use in route handlers
-    req.userId = userId;
+    req.userId = session.userId;
+    req.userEmail = session.email;
+    req.sessionToken = sessionToken;
+    
+    // Refresh session expiry (rolling expiration)
+    await req.redisClient.expire(redisCacheKey, 7 * 24 * 60 * 60);
+    
     next();
   } catch (error) {
     console.error('Authentication error:', error);
@@ -92,8 +114,6 @@ async function fetchTelegramBotDataAndStore(botToken, userId, customBotName = nu
     const webhookUrl = webhookInfo.data.ok ? webhookInfo.data.result.url : null;
     
     // 3. Check if webhook is set - if so, we can't use getUpdates directly
-    // Instead of trying to get updates when webhook is active (which causes 409 conflict),
-    // we'll either get stats another way or disable the webhook first if needed
     let uniqueUsers = new Set();
     let messageCount = 0;
     let errorCount = 0;
@@ -126,9 +146,11 @@ async function fetchTelegramBotDataAndStore(botToken, userId, customBotName = nu
     
     // 4. Find or create the TelegramChannel document
     let telegramChannel = await TelegramChannel.findOne({ botToken });
+    let isNewBot = false;
     
     if (!telegramChannel) {
       // Create new document if it doesn't exist
+      isNewBot = true;
       telegramChannel = new TelegramChannel({
         userId,
         botToken,
@@ -160,6 +182,23 @@ async function fetchTelegramBotDataAndStore(botToken, userId, customBotName = nu
     // 5. Save the document to the database
     await telegramChannel.save();
     console.log(`Data for bot ${telegramChannel.botName} successfully stored/updated`);
+    
+    // 6. Update user data if it's a new bot
+    if (isNewBot) {
+      try {
+        await UserUpdateService.handleNewTelegramBot(userId, telegramChannel);
+      } catch (userUpdateError) {
+        console.error(`Failed to update user data for new bot: ${userUpdateError.message}`);
+        // Continue anyway - the bot is still saved
+      }
+    } else {
+      // Sync all Telegram data to keep user document updated
+      try {
+        await UserUpdateService.syncTelegramChannelsData(userId);
+      } catch (syncError) {
+        console.error(`Failed to sync user's Telegram data: ${syncError.message}`);
+      }
+    }
     
     return telegramChannel;
   } catch (error) {
@@ -283,6 +322,14 @@ router.get('/telegram/get-user-bots', isAuthenticated, async (req, res) => {
     // Get all bots for this user
     const userBots = await getUserBots(userId);
     
+    // Sync Telegram channel count with user profile
+    try {
+      await UserUpdateService.syncTelegramChannelsCount(userId);
+    } catch (syncError) {
+      console.warn(`Could not sync channel count: ${syncError.message}`);
+      // Continue anyway - we still have the bots data
+    }
+    
     res.json({ 
       success: true, 
       data: userBots,
@@ -309,6 +356,14 @@ router.delete('/telegram/delete-bot/:botId', isAuthenticated, async (req, res) =
       return res.status(404).json({ success: false, message: 'Bot not found or access denied' });
     }
     
+    // Update user data after bot deletion
+    try {
+      await UserUpdateService.handleDeletedTelegramBot(userId, botId);
+    } catch (userUpdateError) {
+      console.error(`Failed to update user data after bot deletion: ${userUpdateError.message}`);
+      // Continue anyway - the bot is still deleted
+    }
+    
     res.json({ success: true, message: 'Bot deleted successfully' });
   } catch (error) {
     console.error('Error deleting bot:', error);
@@ -333,6 +388,14 @@ router.post('/telegram/refresh-bot/:botId', isAuthenticated, async (req, res) =>
     
     // Refresh the bot data
     const refreshedData = await fetchTelegramBotDataAndStore(botData.botToken, userId, botData.botName);
+    
+    // Perform full sync of user data to ensure consistency
+    try {
+      await UserUpdateService.fullSyncUserTelegramData(userId);
+    } catch (syncError) {
+      console.error(`Failed to fully sync user data: ${syncError.message}`);
+      // Continue anyway - the bot data is still refreshed
+    }
     
     res.json({ 
       success: true, 
@@ -377,6 +440,14 @@ router.post('/telegram/remove-webhook/:botId', isAuthenticated, async (req, res)
     botData.updatedAt = Date.now();
     await botData.save();
     
+    // Sync Telegram data in user profile
+    try {
+      await UserUpdateService.syncTelegramChannelsData(userId);
+    } catch (syncError) {
+      console.error(`Failed to sync user's Telegram data: ${syncError.message}`);
+      // Continue anyway - the webhook is still removed
+    }
+    
     res.json({ 
       success: true, 
       message: 'Webhook removed successfully',
@@ -388,4 +459,25 @@ router.post('/telegram/remove-webhook/:botId', isAuthenticated, async (req, res)
   }
 });
 
-module.exports = router;  
+/**
+ * Force sync all Telegram data for the user
+ */
+router.post('/telegram/sync-user-data', isAuthenticated, async (req, res) => {
+  try {
+    const userId = req.userId;
+    
+    // Perform full sync of user data
+    const syncResult = await UserUpdateService.fullSyncUserTelegramData(userId);
+    
+    res.json({
+      success: true,
+      message: 'User Telegram data synchronized successfully',
+      channelsCount: syncResult.userData.channelsCount || 0
+    });
+  } catch (error) {
+    console.error('Error syncing user Telegram data:', error);
+    res.status(500).json({ success: false, message: 'Failed to sync user Telegram data' });
+  }
+});
+
+module.exports = router;

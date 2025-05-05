@@ -6,7 +6,7 @@ const userSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true },
   password: { type: String, required: true },
   isVerified: { type: Boolean, default: false },
-
+  
   deviceFingerprint: { type: String },
   deviceInfo: [{
     deviceName: { type: String },
@@ -18,10 +18,10 @@ const userSchema = new mongoose.Schema({
     },
     lastLogin: { type: Date },
   }],
-
+  
   channelsCount: { type: Number, default: 0 },
   botsCount: { type: Number, default: 0 },
-
+  
   channels: [{
     channelType: {
       type: String,
@@ -40,7 +40,7 @@ const userSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now },
     updatedAt: { type: Date, default: Date.now },
   }],
-
+  
   bots: [{
     botType: {
       type: String,
@@ -62,14 +62,14 @@ const userSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now },
     updatedAt: { type: Date, default: Date.now },
   }],
-
+  
   settings: {
     timezone: { type: String, default: 'UTC' },
     language: { type: String, default: 'en' },
     theme: { type: String, default: 'light' },
     apiKey: { type: String },
   },
-
+  
   notificationsPrefs: {
     email: {
       enabled: { type: Boolean, default: true },
@@ -99,4 +99,12 @@ userSchema.methods.comparePassword = async function (password) {
   return await bcrypt.compare(password, this.password);
 };
 
-module.exports = mongoose.model('User', userSchema);
+// Create the model only if it hasn't been registered yet
+let User;
+try {
+  User = mongoose.model('User');
+} catch (e) {
+  User = mongoose.model('User', userSchema);
+}
+
+module.exports = User;
